@@ -1,0 +1,10 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    environment:
+      - BOT_TOKEN=YOUR_BOT_TOKEN
+      - CHANNEL_USERNAME=@your_channel
+      - CHANNEL_ID=@your_channel_id
+    restart: always
