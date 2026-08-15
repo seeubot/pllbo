@@ -4,6 +4,7 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
+from telegram.request import HTTPXRequest
 
 # Configure logging
 logging.basicConfig(
@@ -12,7 +13,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot configuration from environment variables
+# Bot configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 CHANNEL_ID = os.getenv('CHANNEL_ID', '-1004458683062')
 CHANNEL_USERNAME = os.getenv('CHANNEL_USERNAME', '@livetvappiptv')
@@ -21,7 +22,15 @@ CHANNEL_URL = os.getenv('CHANNEL_URL', 'https://t.me/livetvappiptv')
 # WebSocket configuration
 PORT = int(os.getenv('PORT', '8000'))
 HOST = os.getenv('HOST', '0.0.0.0')
-WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')  # Set this on Koyeb
+WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')
+
+# Timeout configuration
+CONNECT_TIMEOUT = int(os.getenv('CONNECT_TIMEOUT', '30'))
+READ_TIMEOUT = int(os.getenv('READ_TIMEOUT', '30'))
+WRITE_TIMEOUT = int(os.getenv('WRITE_TIMEOUT', '30'))
+
+# Proxy configuration (if needed)
+PROXY_URL = os.getenv('PROXY_URL', '')
 
 # Load streams
 def load_streams():
@@ -42,16 +51,13 @@ async def is_member(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
         )
         return member.status in ['member', 'administrator', 'creator']
     except Exception as e:
-        logger.error(f"Error checking membership for {user_id}: {e}")
+        logger.error(f"Error checking membership: {e}")
         return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
     user = update.effective_user
     user_id = user.id
-    username = user.username or user.first_name
-    
-    logger.info(f"User {username} ({user_id}) started the bot")
     
     if not await is_member(user_id, context):
         await show_join_prompt(update, context)
@@ -71,16 +77,15 @@ async def show_join_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔒 *Access Restricted*\n\n"
         f"To use this bot and watch live streams, you must join our channel first.\n\n"
         f"📢 Channel: {CHANNEL_USERNAME}\n\n"
-        f"Steps:\n"
-        f"1️⃣ Click 'Join Channel' button below\n"
+        f"1️⃣ Click 'Join Channel'\n"
         f"2️⃣ Join the channel\n"
-        f"3️⃣ Come back and click 'I've Joined'",
+        f"3️⃣ Click 'I've Joined'",
         reply_markup=reply_markup,
         parse_mode=ParseMode.MARKDOWN
     )
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show main menu with categories"""
+    """Show main menu"""
     categories = sorted(list(set(s['category'] for s in STREAMS if s.get('category'))))
     
     keyboard = []
@@ -88,81 +93,69 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = len([s for s in STREAMS if s.get('category') == cat])
         keyboard.append([InlineKeyboardButton(f"📺 {cat} ({count})", callback_data=f"cat_{cat}")])
     
-    keyboard.append([InlineKeyboardButton("🔍 Search Channel", callback_data="search")])
-    keyboard.append([InlineKeyboardButton("📢 Join Channel", url=CHANNEL_URL)])
+    keyboard.append([InlineKeyboardButton("🔍 Search", callback_data="search")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     if update.callback_query:
         await update.callback_query.edit_message_text(
-            f"🎬 *Chill Box Live TV*\n\n"
-            f"Welcome! Select a category to browse channels:\n\n"
-            f"📢 Join: {CHANNEL_USERNAME}",
+            f"🎬 *Chill Box Live TV*\n\nSelect a category:",
             reply_markup=reply_markup,
             parse_mode=ParseMode.MARKDOWN
         )
     else:
         await update.message.reply_text(
-            f"🎬 *Chill Box Live TV*\n\n"
-            f"Welcome! Select a category to browse channels:\n\n"
-            f"📢 Join: {CHANNEL_USERNAME}",
+            f"🎬 *Chill Box Live TV*\n\nSelect a category:",
             reply_markup=reply_markup,
             parse_mode=ParseMode.MARKDOWN
         )
 
 async def show_channels(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str):
-    """Show channels in a category"""
+    """Show channels in category"""
     channels = [s for s in STREAMS if s.get('category') == category]
     
     keyboard = []
     for ch in channels:
         keyboard.append([InlineKeyboardButton(f"📺 {ch['name']}", callback_data=f"play_{ch['id']}")])
     
-    keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="back_to_menu")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.callback_query.edit_message_text(
-        f"*{category} Channels* ({len(channels)})\n\n"
-        f"Select a channel to play:",
+        f"*{category}* ({len(channels)} channels)\n\nSelect a channel:",
         reply_markup=reply_markup,
         parse_mode=ParseMode.MARKDOWN
     )
 
 async def play_stream(update: Update, context: ContextTypes.DEFAULT_TYPE, stream_id: str):
-    """Play stream as video"""
+    """Play stream"""
     query = update.callback_query
     stream = next((s for s in STREAMS if s['id'] == stream_id), None)
     
     if not stream:
-        await query.answer("❌ Stream not found!", show_alert=True)
+        await query.answer("Stream not found!", show_alert=True)
         return
     
-    await query.answer(f"🎬 Loading {stream['name']}...")
+    await query.answer(f"Loading {stream['name']}...")
     
     try:
         if stream.get('url'):
             await query.message.reply_video(
                 video=stream['url'],
-                caption=f"🎬 *{stream['name']}*\n"
-                        f"📂 Category: {stream.get('category', 'General')}\n\n"
-                        f"📢 Join: {CHANNEL_USERNAME}\n"
-                        f"🔗 {CHANNEL_URL}",
+                caption=f"🎬 *{stream['name']}*\n\n📢 {CHANNEL_USERNAME}",
                 parse_mode=ParseMode.MARKDOWN,
                 supports_streaming=True,
                 timeout=120
             )
         else:
-            await query.message.reply_text("❌ Stream URL not available!")
+            await query.message.reply_text("Stream URL not available!")
     except Exception as e:
         logger.error(f"Error playing stream: {e}")
-        await query.message.reply_text(
-            f"❌ Error playing stream. Please try again later.\n\n"
-            f"📢 Join {CHANNEL_USERNAME} for updates."
-        )
+        await query.message.reply_text("❌ Error playing stream. Try again later.")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle button callbacks"""
+    """Handle callbacks"""
     query = update.callback_query
     await query.answer()
     
@@ -171,23 +164,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if data == "check_membership":
         if await is_member(user_id, context):
-            await query.edit_message_text(
-                "✅ *Membership Verified!*\n\n"
-                "Welcome to Chill Box Live TV! 🎬",
-                parse_mode=ParseMode.MARKDOWN
-            )
+            await query.edit_message_text("✅ Verified! Welcome!")
             await show_main_menu(update, context)
         else:
-            await query.answer("❌ You haven't joined yet!", show_alert=True)
+            await query.answer("Not joined yet!", show_alert=True)
     
     elif data == "back_to_menu":
         await show_main_menu(update, context)
     
     elif data == "search":
         await query.edit_message_text(
-            "🔍 *Search Channel*\n\n"
-            "Send the channel name you want to search.\n"
-            "Example: `zee` or `sun` or `sports`",
+            "🔍 Send channel name to search:",
             parse_mode=ParseMode.MARKDOWN
         )
         context.user_data['searching'] = True
@@ -201,10 +188,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await play_stream(update, context, stream_id)
 
 async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle search messages"""
+    """Handle search"""
     if context.user_data.get('searching'):
         query_text = update.message.text.lower().strip()
-        
         results = [s for s in STREAMS if query_text in s.get('name', '').lower()]
         
         if results:
@@ -212,72 +198,59 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for s in results[:15]:
                 keyboard.append([InlineKeyboardButton(f"📺 {s['name']}", callback_data=f"play_{s['id']}")])
             
-            keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")])
-            
+            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="back_to_menu")])
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             await update.message.reply_text(
-                f"🔍 *Search Results* for '{query_text}':\n"
-                f"Found {len(results)} channels",
+                f"Found {len(results)} channels:",
                 reply_markup=reply_markup,
                 parse_mode=ParseMode.MARKDOWN
             )
         else:
-            await update.message.reply_text(
-                f"❌ No channels found for '{query_text}'",
-                parse_mode=ParseMode.MARKDOWN
-            )
+            await update.message.reply_text("No channels found!")
         
         context.user_data['searching'] = False
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help command"""
-    await update.message.reply_text(
-        "🎬 *Chill Box Live TV Bot*\n\n"
-        "Commands:\n"
-        "/start - Start bot\n"
-        "/menu - Show channel menu\n"
-        "/help - Show this help\n\n"
-        f"📢 Must join: {CHANNEL_USERNAME}\n"
-        f"🔗 {CHANNEL_URL}",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
 def main():
-    """Main function with WebSocket support"""
+    """Main function"""
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN environment variable is required!")
+        logger.error("BOT_TOKEN is required!")
         return
     
+    # Create request with timeout
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=CONNECT_TIMEOUT,
+        read_timeout=READ_TIMEOUT,
+        write_timeout=WRITE_TIMEOUT,
+    )
+    
     # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .write_timeout(WRITE_TIMEOUT)
+        .build()
+    )
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("menu", show_main_menu))
-    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search))
     
-    logger.info(f"Bot started!")
+    logger.info("Bot starting...")
     logger.info(f"Channel: {CHANNEL_USERNAME}")
-    logger.info(f"Channel ID: {CHANNEL_ID}")
-    logger.info(f"Total streams: {len(STREAMS)}")
+    logger.info(f"Streams: {len(STREAMS)}")
     
-    # Start with WebSocket
-    if WEBHOOK_URL:
-        # Webhook mode (for production)
-        logger.info(f"Starting webhook on {WEBHOOK_URL}")
-        application.run_webhook(
-            listen=HOST,
-            port=PORT,
-            webhook_url=WEBHOOK_URL,
-            allowed_updates=Update.ALL_TYPES
-        )
-    else:
-        # Polling mode (for local testing)
-        logger.info("Starting polling mode")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Run in polling mode (simpler for Koyeb)
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 if __name__ == '__main__':
     main()
