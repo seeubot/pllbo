@@ -13,7 +13,6 @@ Designed to run on Koyeb:
 """
 
 import asyncio
-import html
 import json
 import logging
 import os
@@ -31,6 +30,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+from telegram.request import HTTPXRequest
 
 # --------------------------------------------------------------------------
 # Config
@@ -119,7 +119,19 @@ def load_streams(path: str) -> list:
     return valid
 
 
+def build_indices(streams: list) -> tuple[dict, dict, list]:
+    """Precompute lookup structures once, instead of scanning/sorting STREAMS
+    on every button click (this is the main per-click latency win)."""
+    by_id = {s["id"]: s for s in streams}
+    by_category: dict[str, list] = {}
+    for s in streams:
+        by_category.setdefault(s.get("category", "General"), []).append(s)
+    categories = sorted(by_category.keys())
+    return by_id, by_category, categories
+
+
 STREAMS = load_streams(STREAMS_FILE)
+STREAMS_BY_ID, CHANNELS_BY_CATEGORY, CATEGORIES = build_indices(STREAMS)
 
 # Simple in-memory membership cache: user_id -> (is_member: bool, checked_at: float)
 _membership_cache: dict[int, tuple[bool, float]] = {}
@@ -165,8 +177,7 @@ def chunk(items: list, size: int) -> list:
 
 
 def build_category_keyboard() -> InlineKeyboardMarkup:
-    categories = sorted({s.get("category", "General") for s in STREAMS})
-    buttons = [InlineKeyboardButton(f"📺 {c}", callback_data=f"cat_{c}_0") for c in categories]
+    buttons = [InlineKeyboardButton(f"📺 {c}", callback_data=f"cat_{c}_0") for c in CATEGORIES]
     rows = chunk(buttons, CATEGORY_COLUMNS)
     if not rows:
         rows = [[InlineKeyboardButton("No streams available yet", callback_data="noop")]]
@@ -174,7 +185,7 @@ def build_category_keyboard() -> InlineKeyboardMarkup:
 
 
 def build_channel_keyboard(category: str, page: int) -> tuple[InlineKeyboardMarkup, int]:
-    channels = [s for s in STREAMS if s.get("category", "General") == category]
+    channels = CHANNELS_BY_CATEGORY.get(category, [])
     pages = chunk(channels, PAGE_SIZE)
     total_pages = max(len(pages), 1)
     page = max(0, min(page, total_pages - 1))
@@ -284,18 +295,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("play_"):
         stream_id = data[len("play_"):]
-        stream = next((s for s in STREAMS if s["id"] == stream_id), None)
+        stream = STREAMS_BY_ID.get(stream_id)
 
         if not stream:
             await query.answer("Stream not found — it may have been removed.", show_alert=True)
             return
 
         if PUBLIC_BASE_URL:
-            player_url = f"{PUBLIC_BASE_URL}/play?id={quote(stream_id)}"
+            player_url = f"{PUBLIC_BASE_URL}/public/index.html?id={quote(stream_id)}"
             buttons = [[InlineKeyboardButton("▶️ Watch now", web_app=WebAppInfo(url=player_url))]]
-            # web_app buttons only render in private chats; a plain URL button
-            # is a fallback that works everywhere (opens the player in a browser).
-            buttons.append([InlineKeyboardButton("🌐 Open in browser", url=player_url)])
             await query.message.reply_text(
                 f"🎬 *{stream['name']}*\n\nTap below to watch.",
                 reply_markup=InlineKeyboardMarkup(buttons),
@@ -315,11 +323,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reload_streams_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: reload streams.json without restarting the bot."""
-    global STREAMS
+    global STREAMS, STREAMS_BY_ID, CHANNELS_BY_CATEGORY, CATEGORIES
     admin_ids = {i.strip() for i in os.getenv("ADMIN_IDS", "").split(",") if i.strip()}
     if str(update.effective_user.id) not in admin_ids:
         return
     STREAMS = load_streams(STREAMS_FILE)
+    STREAMS_BY_ID, CHANNELS_BY_CATEGORY, CATEGORIES = build_indices(STREAMS)
     await update.message.reply_text(f"✅ Reloaded {len(STREAMS)} stream(s).")
 
 
@@ -333,98 +342,44 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # Telegram's sendVideo can't handle stream playlists directly)
 # --------------------------------------------------------------------------
 
-PLAYER_PAGE_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>{title}</title>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
-<style>
-  * {{ box-sizing: border-box; }}
-  html, body {{
-    margin: 0; padding: 0; height: 100%; background: #0b0b0f; color: #f2f2f2;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  }}
-  .wrap {{ display: flex; flex-direction: column; height: 100%; }}
-  header {{ padding: 12px 16px; font-size: 15px; font-weight: 600; background: #14141b; }}
-  .player {{ flex: 1; display: flex; align-items: center; justify-content: center; background: #000; }}
-  video {{ width: 100%; height: 100%; max-height: 100vh; background: #000; }}
-  .status {{ position: absolute; color: #aaa; font-size: 14px; text-align: center; padding: 0 24px; }}
-  .hint {{ padding: 10px 16px; font-size: 12px; color: #888; background: #14141b; }}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header>🎬 {title}</header>
-  <div class="player">
-    <div id="status" class="status">Loading stream…</div>
-    <video id="video" controls autoplay playsinline style="display:none"></video>
-  </div>
-  <div class="hint">If playback fails, the source may require a direct player like VLC.</div>
-</div>
-<script>
-  const url = {url_json};
-  const video = document.getElementById('video');
-  const status = document.getElementById('status');
+# --------------------------------------------------------------------------
+# Web server: health check + static player (required for Koyeb web services;
+# the player is what makes m3u8 streams watchable, since Telegram's
+# sendVideo can't handle stream playlists directly).
+#
+# The player itself lives in public/index.html as a plain static file (Plyr
+# UI + hls.js for playback) and is served as-is — no per-request templating.
+# It fetches stream details from /api/stream?id=<id>, keeping the server
+# side to a small, fast JSON lookup.
+# --------------------------------------------------------------------------
 
-  function showVideo() {{
-    status.style.display = 'none';
-    video.style.display = 'block';
-  }}
-
-  if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-    // Native HLS support (Safari/iOS)
-    video.src = url;
-    video.addEventListener('loadedmetadata', showVideo);
-    video.addEventListener('error', () => {{ status.textContent = 'Could not load this stream.'; }});
-    video.play().catch(() => {{}});
-  }} else if (window.Hls && Hls.isSupported()) {{
-    const hls = new Hls();
-    hls.loadSource(url);
-    hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => {{
-      showVideo();
-      video.play().catch(() => {{}});
-    }});
-    hls.on(Hls.Events.ERROR, (_evt, data) => {{
-      if (data.fatal) {{
-        status.textContent = 'Could not load this stream (' + data.type + ').';
-      }}
-    }});
-  }} else {{
-    status.textContent = 'Your browser does not support HLS playback.';
-  }}
-</script>
-</body>
-</html>
-"""
+PUBLIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "public")
 
 
 async def health(_request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "streams_loaded": len(STREAMS)})
 
 
-async def play_page(request: web.Request) -> web.Response:
+async def api_stream(request: web.Request) -> web.Response:
     stream_id = request.query.get("id", "")
-    stream = next((s for s in STREAMS if s["id"] == stream_id), None)
-    logger.info("PLAYER_TRACE /play requested id=%r found=%s", stream_id, stream is not None)
+    stream = STREAMS_BY_ID.get(stream_id)
+    logger.info("PLAYER_TRACE /api/stream requested id=%r found=%s", stream_id, stream is not None)
 
     if not stream:
-        return web.Response(status=404, text="Stream not found.")
+        return web.json_response({"error": "not_found"}, status=404)
 
-    page = PLAYER_PAGE_TEMPLATE.format(
-        title=html.escape(stream["name"]),
-        url_json=json.dumps(stream["url"]),  # safe embedding into the <script> block
-    )
-    return web.Response(text=page, content_type="text/html")
+    return web.json_response({"id": stream["id"], "name": stream["name"], "url": stream["url"]})
 
 
 async def run_health_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/health", health)
     app.router.add_get("/", health)
-    app.router.add_get("/play", play_page)
+    app.router.add_get("/api/stream", api_stream)
+    if os.path.isdir(PUBLIC_DIR):
+        app.router.add_static("/public/", path=PUBLIC_DIR, name="public", show_index=False)
+    else:
+        logger.warning("public/ directory not found at %s — player page will not be served.", PUBLIC_DIR)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -438,7 +393,18 @@ async def run_health_server() -> web.AppRunner:
 # --------------------------------------------------------------------------
 
 async def run():
-    application = Application.builder().token(BOT_TOKEN).build()
+    # concurrent_updates lets independent button clicks/commands be handled in
+    # parallel instead of one-at-a-time, which is the main source of perceived
+    # lag when multiple users (or rapid taps) hit the bot at once. The larger
+    # connection pool avoids requests queuing up behind a small default pool.
+    request = HTTPXRequest(connection_pool_size=16, pool_timeout=10.0)
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .concurrent_updates(64)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("reload", reload_streams_command))
