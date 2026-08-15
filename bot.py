@@ -13,15 +13,17 @@ Designed to run on Koyeb:
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
 import signal
 import time
 from typing import Optional
+from urllib.parse import quote
 
 from aiohttp import web
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -47,6 +49,12 @@ CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/livetvappiptv")
 STREAMS_FILE = os.getenv("STREAMS_FILE", "streams.json")
 PORT = int(os.getenv("PORT", "8000"))
 
+# Public HTTPS URL this service is reachable at (e.g. your Koyeb app URL,
+# https://yelling-merci-seeutech-f6258452.koyeb.app). Required to build
+# in-app player links for the "play_" buttons. Without it, play buttons fall
+# back to sending the raw stream URL as text.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
 # How many channel buttons to show per page in a category.
 PAGE_SIZE = 8
 # How many category buttons per row.
@@ -67,6 +75,12 @@ if not BOT_TOKEN:
 
 if not CHANNEL_ID:
     _fail("CHANNEL_ID environment variable is required but not set.")
+
+if not PUBLIC_BASE_URL:
+    logger.warning(
+        "PUBLIC_BASE_URL is not set — 'play' buttons will fall back to sending "
+        "the raw stream URL instead of an in-app HLS player link."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -276,15 +290,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Stream not found — it may have been removed.", show_alert=True)
             return
 
-        try:
-            await query.message.reply_video(
-                video=stream["url"],
-                caption=f"🎬 {stream['name']}\n\n📢 {CHANNEL_USERNAME}",
-                supports_streaming=True,
+        if PUBLIC_BASE_URL:
+            player_url = f"{PUBLIC_BASE_URL}/play?id={quote(stream_id)}"
+            buttons = [[InlineKeyboardButton("▶️ Watch now", web_app=WebAppInfo(url=player_url))]]
+            # web_app buttons only render in private chats; a plain URL button
+            # is a fallback that works everywhere (opens the player in a browser).
+            buttons.append([InlineKeyboardButton("🌐 Open in browser", url=player_url)])
+            await query.message.reply_text(
+                f"🎬 *{stream['name']}*\n\nTap below to watch.",
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode="Markdown",
             )
-        except TelegramError as e:
-            logger.error("Failed to send stream '%s': %s", stream_id, e)
-            await query.answer("Couldn't send that stream right now. Please try again.", show_alert=True)
+            return
+
+        # No PUBLIC_BASE_URL configured — fall back to sharing the raw link.
+        # Note: sendVideo does NOT work for .m3u8 playlists (Telegram needs an
+        # actual video file, not a stream manifest), so we send it as text.
+        await query.message.reply_text(
+            f"🎬 {stream['name']}\n\n{stream['url']}\n\n"
+            "Open this link in a player that supports HLS (e.g. VLC).",
+            disable_web_page_preview=True,
+        )
 
 
 async def reload_streams_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -302,17 +328,103 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------------------------------
-# Health check server (required for Koyeb web services; harmless otherwise)
+# Web server: health check + in-app HLS player (required for Koyeb web
+# services; the player route is what makes m3u8 streams watchable, since
+# Telegram's sendVideo can't handle stream playlists directly)
 # --------------------------------------------------------------------------
+
+PLAYER_PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{title}</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<style>
+  * {{ box-sizing: border-box; }}
+  html, body {{
+    margin: 0; padding: 0; height: 100%; background: #0b0b0f; color: #f2f2f2;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }}
+  .wrap {{ display: flex; flex-direction: column; height: 100%; }}
+  header {{ padding: 12px 16px; font-size: 15px; font-weight: 600; background: #14141b; }}
+  .player {{ flex: 1; display: flex; align-items: center; justify-content: center; background: #000; }}
+  video {{ width: 100%; height: 100%; max-height: 100vh; background: #000; }}
+  .status {{ position: absolute; color: #aaa; font-size: 14px; text-align: center; padding: 0 24px; }}
+  .hint {{ padding: 10px 16px; font-size: 12px; color: #888; background: #14141b; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>🎬 {title}</header>
+  <div class="player">
+    <div id="status" class="status">Loading stream…</div>
+    <video id="video" controls autoplay playsinline style="display:none"></video>
+  </div>
+  <div class="hint">If playback fails, the source may require a direct player like VLC.</div>
+</div>
+<script>
+  const url = {url_json};
+  const video = document.getElementById('video');
+  const status = document.getElementById('status');
+
+  function showVideo() {{
+    status.style.display = 'none';
+    video.style.display = 'block';
+  }}
+
+  if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+    // Native HLS support (Safari/iOS)
+    video.src = url;
+    video.addEventListener('loadedmetadata', showVideo);
+    video.addEventListener('error', () => {{ status.textContent = 'Could not load this stream.'; }});
+    video.play().catch(() => {{}});
+  }} else if (window.Hls && Hls.isSupported()) {{
+    const hls = new Hls();
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {{
+      showVideo();
+      video.play().catch(() => {{}});
+    }});
+    hls.on(Hls.Events.ERROR, (_evt, data) => {{
+      if (data.fatal) {{
+        status.textContent = 'Could not load this stream (' + data.type + ').';
+      }}
+    }});
+  }} else {{
+    status.textContent = 'Your browser does not support HLS playback.';
+  }}
+</script>
+</body>
+</html>
+"""
+
 
 async def health(_request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "streams_loaded": len(STREAMS)})
+
+
+async def play_page(request: web.Request) -> web.Response:
+    stream_id = request.query.get("id", "")
+    stream = next((s for s in STREAMS if s["id"] == stream_id), None)
+    logger.info("PLAYER_TRACE /play requested id=%r found=%s", stream_id, stream is not None)
+
+    if not stream:
+        return web.Response(status=404, text="Stream not found.")
+
+    page = PLAYER_PAGE_TEMPLATE.format(
+        title=html.escape(stream["name"]),
+        url_json=json.dumps(stream["url"]),  # safe embedding into the <script> block
+    )
+    return web.Response(text=page, content_type="text/html")
 
 
 async def run_health_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/health", health)
     app.router.add_get("/", health)
+    app.router.add_get("/play", play_page)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
