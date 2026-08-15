@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Chill Box Player</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.css">
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; background: #0b0b0f; color: #f2f2f2;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+  }
+  .wrap { display: flex; flex-direction: column; height: 100%; }
+  header {
+    padding: 10px 16px; font-size: 14px; font-weight: 600; background: #14141b;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .player-area { position: relative; flex: 1; background: #000; min-height: 0; }
+  .plyr, video { width: 100%; height: 100%; }
+
+  #status {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: #aaa; font-size: 14px; text-align: center; padding: 0 24px; z-index: 2;
+  }
+
+  /* Chill BOX watermark, non-interactive so it never blocks the controls */
+  .watermark {
+    position: absolute;
+    top: 14px;
+    right: 16px;
+    z-index: 3;
+    pointer-events: none;
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: 0.5px;
+    color: rgba(255, 255, 255, 0.55);
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+    user-select: none;
+  }
+  .watermark span { color: rgba(255, 90, 90, 0.75); }
+
+  .hint {
+    padding: 8px 16px; font-size: 11px; color: #777; background: #14141b;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header id="title">🎬 Chill Box</header>
+  <div class="player-area">
+    <div id="status">Loading stream…</div>
+    <div class="watermark">Chill <span>BOX</span></div>
+    <video id="video" playsinline controls></video>
+  </div>
+  <div class="hint">If playback fails, the source may require a direct player like VLC.</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.min.js"></script>
+<script>
+(function () {
+  const video = document.getElementById('video');
+  const status = document.getElementById('status');
+  const titleEl = document.getElementById('title');
+
+  const params = new URLSearchParams(window.location.search);
+  const id = params.get('id');
+
+  if (!id) {
+    status.textContent = 'No stream specified.';
+    return;
+  }
+
+  fetch('/api/stream?id=' + encodeURIComponent(id))
+    .then((res) => {
+      if (!res.ok) throw new Error('not_found');
+      return res.json();
+    })
+    .then((data) => initPlayer(data.url, data.name))
+    .catch(() => {
+      status.textContent = 'Stream not found.';
+    });
+
+  function initPlayer(url, name) {
+    titleEl.textContent = '🎬 ' + name;
+    document.title = name + ' — Chill Box';
+
+    let hls = null;
+
+    if (window.Hls && Hls.isSupported()) {
+      hls = new Hls();
+      hls.loadSource(url);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, function () {
+        status.style.display = 'none';
+
+        // Build the Plyr quality menu from the HLS levels (heights, e.g. 1080/720/480).
+        const availableQualities = hls.levels.map((l) => l.height);
+        availableQualities.unshift(0); // 0 = Auto
+
+        const player = new Plyr(video, {
+          controls: [
+            'play-large', 'play', 'progress', 'current-time', 'mute',
+            'volume', 'settings', 'pip', 'airplay', 'fullscreen',
+          ],
+          settings: ['quality', 'speed'],
+          quality: {
+            default: 0,
+            options: availableQualities,
+            forced: true,
+            onChange: updateQuality,
+          },
+          i18n: {
+            qualityLabel: { 0: 'Auto' },
+          },
+        });
+
+        function updateQuality(newQuality) {
+          if (newQuality === 0) {
+            hls.currentLevel = -1; // Auto
+          } else {
+            hls.levels.forEach((level, levelIndex) => {
+              if (level.height === newQuality) {
+                hls.currentLevel = levelIndex;
+              }
+            });
+          }
+        }
+
+        video.play().catch(() => {});
+      });
+
+      hls.on(Hls.Events.ERROR, function (_evt, data) {
+        if (data.fatal) {
+          status.style.display = 'block';
+          status.textContent = 'Could not load this stream (' + data.type + ').';
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Native HLS support (Safari/iOS) — no separate quality levels exposed,
+      // the OS handles adaptive switching itself.
+      video.src = url;
+      new Plyr(video);
+      video.addEventListener('loadedmetadata', () => {
+        status.style.display = 'none';
+        video.play().catch(() => {});
+      });
+      video.addEventListener('error', () => {
+        status.textContent = 'Could not load this stream.';
+      });
+    } else {
+      status.textContent = 'Your browser does not support HLS playback.';
+    }
+  }
+})();
+</script>
+</body>
+</html>
