@@ -115,20 +115,34 @@ _membership_cache: dict[int, tuple[bool, float]] = {}
 # Helpers
 # --------------------------------------------------------------------------
 
-async def is_member(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check (and cache) whether a user belongs to the gate channel."""
-    cached = _membership_cache.get(user_id)
-    if cached and (time.time() - cached[1]) < MEMBERSHIP_CACHE_TTL:
-        return cached[0]
+async def is_member(user_id: int, context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> bool:
+    """Check whether a user belongs to the gate channel.
+
+    Only positive results are cached. A "not a member" result is never cached,
+    so a user who just joined and immediately taps "I've Joined" always gets a
+    fresh check instead of a stale negative from before they joined.
+    `force=True` skips the cache entirely (used by the "I've Joined" button).
+    """
+    if not force:
+        cached = _membership_cache.get(user_id)
+        if cached and (time.time() - cached[1]) < MEMBERSHIP_CACHE_TTL:
+            return cached[0]
 
     try:
         member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
         result = member.status in REQUIRED_MEMBER_STATUSES
     except TelegramError as e:
-        logger.warning("Membership check failed for user %s: %s", user_id, e)
+        logger.warning(
+            "Membership check failed for user %s against CHANNEL_ID=%r: %s",
+            user_id, CHANNEL_ID, e,
+        )
         result = False
 
-    _membership_cache[user_id] = (result, time.time())
+    if result:
+        _membership_cache[user_id] = (result, time.time())
+    else:
+        _membership_cache.pop(user_id, None)
+
     return result
 
 
@@ -181,6 +195,7 @@ def join_prompt_keyboard() -> InlineKeyboardMarkup:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.info("BUTTON_TRACE /start received from user_id=%s username=%s", user_id, update.effective_user.username)
 
     if not await is_member(user_id, context):
         await update.message.reply_text(
@@ -207,6 +222,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data or ""
     user_id = query.from_user.id
+    logger.info(
+        "BUTTON_TRACE callback received: data=%r user_id=%s username=%s",
+        data, user_id, query.from_user.username,
+    )
 
     # Every gated action re-checks membership except the join-check button itself,
     # so someone who left the channel loses access again.
@@ -222,7 +241,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "check":
-        if await is_member(user_id, context):
+        result = await is_member(user_id, context, force=True)
+        logger.info(
+            "BUTTON_TRACE 'I've Joined' clicked by user_id=%s | CHANNEL_ID=%r | is_member=%s",
+            user_id, CHANNEL_ID, result,
+        )
+        if result:
             await query.edit_message_text("✅ Verified!")
             await show_menu(update, context)
         else:
