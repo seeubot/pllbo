@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chill Box Player</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.4.12/dist/hls.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/shaka-player@4.3.8/dist/shaka-player.ui.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/shaka-player@4.3.8/dist/controls.css">
+    
+    <style>
+        :root {
+            --bg: #0a0a0f;
+            --accent: #E50914;
+            --text: #ffffff;
+        }
+        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            background: var(--bg);
+            font-family: -apple-system, sans-serif;
+            color: var(--text);
+            height: 100vh;
+            overflow: hidden;
+        }
+        
+        .player-wrapper {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+        
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+        
+        .watermark {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            color: rgba(255,255,255,0.4);
+            font-size: 11px;
+            font-weight: bold;
+            z-index: 10;
+            pointer-events: none;
+        }
+        
+        .back-btn {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0,0,0,0.5);
+            color: #fff;
+            border: none;
+            padding: 10px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            z-index: 20;
+        }
+        
+        .back-btn:hover {
+            background: rgba(0,0,0,0.7);
+        }
+        
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            z-index: 30;
+        }
+        
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid rgba(255,255,255,0.2);
+            border-top: 3px solid var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .error-msg {
+            color: #ff6b6b;
+            text-align: center;
+            padding: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="player-wrapper">
+        <button class="back-btn" onclick="goBack()">← Back</button>
+        <div class="watermark">CHILL BOX</div>
+        <video id="video" controls autoplay playsinline></video>
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <span>Loading stream...</span>
+        </div>
+    </div>
+
+    <script>
+        const API_SECRET = 'mayatv';
+        let hls = null;
+        let shakaPlayer = null;
+        
+        async function loadStream() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const channelId = urlParams.get('id');
+            
+            if (!channelId) {
+                showError('No channel specified');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/api/get-stream?id=${encodeURIComponent(channelId)}`, {
+                    headers: {
+                        'X-API-Key': API_SECRET,
+                        'X-Request-Token': generateToken(),
+                        'X-Referer': window.location.href,
+                    }
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Failed to get stream');
+                }
+                
+                const data = await response.json();
+                
+                if (data.success && data.streamUrl) {
+                    playStream(data.streamUrl, data.drm);
+                } else {
+                    showError('Stream not available');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                showError('Failed to load stream');
+            }
+        }
+        
+        function generateToken() {
+            const timestamp = Date.now();
+            const random = Math.random().toString(36).substring(7);
+            return btoa(`${timestamp}.${random}`);
+        }
+        
+        function playStream(url, drm) {
+            const video = document.getElementById('video');
+            const loading = document.getElementById('loading');
+            
+            if (url.includes('.m3u8')) {
+                // HLS
+                if (Hls.isSupported()) {
+                    hls = new Hls({
+                        maxBufferLength: 30,
+                        enableWorker: true,
+                        xhrSetup: (xhr) => {
+                            xhr.setRequestHeader('Referer', window.location.origin);
+                        }
+                    });
+                    
+                    hls.loadSource(url);
+                    hls.attachMedia(video);
+                    
+                    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                        loading.style.display = 'none';
+                        video.play();
+                    });
+                    
+                    hls.on(Hls.Events.ERROR, (event, data) => {
+                        if (data.fatal) {
+                            showError('Stream error');
+                        }
+                    });
+                } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                    video.src = url;
+                    video.addEventListener('loadedmetadata', () => {
+                        loading.style.display = 'none';
+                        video.play();
+                    });
+                }
+            } else if (url.includes('.mpd')) {
+                // DASH
+                try {
+                    shaka.polyfill.installAll();
+                    shakaPlayer = new shaka.Player(video);
+                    
+                    if (drm && drm.clearKeys) {
+                        shakaPlayer.configure({
+                            drm: {
+                                clearKeys: drm.clearKeys
+                            }
+                        });
+                    }
+                    
+                    shakaPlayer.load(url).then(() => {
+                        loading.style.display = 'none';
+                        video.play();
+                    }).catch(err => {
+                        console.error('Shaka error:', err);
+                        showError('DASH stream error');
+                    });
+                } catch (e) {
+                    showError('DASH not supported');
+                }
+            } else if (url.includes('.mp4')) {
+                video.src = url;
+                video.addEventListener('loadedmetadata', () => {
+                    loading.style.display = 'none';
+                    video.play();
+                });
+            }
+        }
+        
+        function showError(message) {
+            document.getElementById('loading').innerHTML = `
+                <div class="error-msg">${message}</div>
+            `;
+        }
+        
+        function goBack() {
+            window.location.href = '/';
+        }
+        
+        // Start loading
+        loadStream();
+        
+        // Protection
+        document.addEventListener('contextmenu', (e) => e.preventDefault());
+        document.addEventListener('keydown', (e) => {
+            if ((e.ctrlKey && ['s', 'u', 'p'].includes(e.key.toLowerCase())) || e.key === 'F12') {
+                e.preventDefault();
+            }
+        });
+        
+        // Console protection
+        setInterval(() => {
+            const before = new Date().getTime();
+            debugger;
+            const after = new Date().getTime();
+            if (after - before > 100) {
+                document.body.innerHTML = 'Developer tools detected!';
+            }
+        }, 1000);
+    </script>
+</body>
+</html>
