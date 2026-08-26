@@ -24,14 +24,13 @@ CHANNELS = load_channels()
 class SecureHandler(http.server.SimpleHTTPRequestHandler):
     
     def log_message(self, format, *args):
-        # Log all requests
-        print(f"[{time.strftime('%H:%M:%S')}] {format % args}")
+        print(f"[LOG] {format % args}")
     
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
         
-        print(f"GET {path} - Query: {parsed.query}")
+        print(f"\n[REQUEST] {path}")
         
         if path == '/':
             self.serve_index()
@@ -50,23 +49,15 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
         params = parse_qs(parsed.query)
         channel_id = params.get('id', [''])[0]
         
-        if not channel_id:
-            self.send_html("<h1>No channel</h1>", 400)
-            return
-        
         channel = next((ch for ch in CHANNELS if ch['id'] == channel_id), None)
         
         if not channel:
             self.send_html("<h1>Channel not found</h1>", 404)
             return
         
-        expires = int(time.time()) + 300
+        expires = int(time.time()) + 600  # 10 minutes
         token = self.generate_token(channel_id, expires)
         proxy_url = f"/stream?id={channel_id}&token={token}&expires={expires}"
-        
-        print(f"Serving player for: {channel['name']}")
-        print(f"Real URL: {channel['url']}")
-        print(f"Proxy URL: {proxy_url}")
         
         html = f'''<!DOCTYPE html>
 <html>
@@ -106,13 +97,10 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
             const video = document.getElementById('video');
             const loading = document.getElementById('loading');
             
-            console.log('Loading stream from:', PROXY_URL);
-            
             if (Hls.isSupported()) {{
                 hls = new Hls({{
                     maxBufferLength: 30,
                     enableWorker: true,
-                    debug: false,
                     xhrSetup: (xhr) => {{
                         xhr.setRequestHeader('Referer', window.location.origin);
                     }}
@@ -122,7 +110,6 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
                 hls.attachMedia(video);
                 
                 hls.on(Hls.Events.MANIFEST_PARSED, () => {{
-                    console.log('Manifest loaded successfully');
                     loading.style.display = 'none';
                     video.play().catch(() => {{}});
                 }});
@@ -132,21 +119,14 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
                     if (data.fatal) {{
                         switch(data.type) {{
                             case Hls.ErrorTypes.NETWORK_ERROR:
-                                console.log('Network error - retrying');
-                                hls.startLoad();
+                                setTimeout(() => hls.startLoad(), 2000);
                                 break;
                             case Hls.ErrorTypes.MEDIA_ERROR:
-                                console.log('Media error - recovering');
                                 hls.recoverMediaError();
-                                break;
-                            default:
-                                loading.innerHTML = '<span>Stream error</span>';
                                 break;
                         }}
                     }}
                 }});
-            }} else {{
-                loading.innerHTML = '<span>HLS not supported</span>';
             }}
         }}
         
@@ -158,49 +138,38 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
         self.send_html(html)
     
     def serve_stream_proxy(self, parsed):
-        """Proxy the actual stream"""
+        """Proxy stream content"""
         params = parse_qs(parsed.query)
         channel_id = params.get('id', [''])[0]
         token = params.get('token', [''])[0]
         expires = params.get('expires', [''])[0]
         segment_url = params.get('segment', [''])[0]
         
-        print(f"\nStream proxy request:")
-        print(f"  Channel: {channel_id}")
-        print(f"  Token: {token[:20]}...")
-        print(f"  Expires: {expires}")
-        print(f"  Segment: {segment_url[:100] if segment_url else 'None (master playlist)'}")
-        
-        # Validate
-        if not token or not expires:
-            print("  Missing token or expires")
-            self.send_error(403)
-            return
+        print(f"[PROXY] Channel: {channel_id}, Segment: {bool(segment_url)}")
         
         if not self.validate_token(channel_id, token, expires):
-            print("  Invalid token")
+            print("[PROXY] Invalid token")
             self.send_error(403)
             return
         
         if int(expires) < int(time.time()):
-            print("  Token expired")
+            print("[PROXY] Expired")
             self.send_error(403)
             return
         
         channel = next((ch for ch in CHANNELS if ch['id'] == channel_id), None)
         
         if not channel:
-            print("  Channel not found")
+            print("[PROXY] Channel not found")
             self.send_error(404)
             return
         
-        # Determine real URL
         if segment_url:
             real_url = urllib.parse.unquote(segment_url)
         else:
             real_url = channel['url']
         
-        print(f"  Real URL: {real_url}")
+        print(f"[PROXY] Real URL: {real_url}")
         
         try:
             headers = {
@@ -215,12 +184,14 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
             response = urllib.request.urlopen(req, timeout=30)
             
             content = response.read()
-            content_type = response.headers.get('Content-Type', '')
             
-            print(f"  Response: {response.status} | Type: {content_type} | Size: {len(content)} bytes")
+            print(f"[PROXY] Response: {response.status}, Size: {len(content)} bytes")
             
-            if '.m3u8' in real_url or 'playlist' in real_url.lower() or '#EXTM3U' in content[:100].decode('utf-8', errors='ignore'):
-                # It's a playlist
+            # Check if it's a playlist
+            text_content = content[:200].decode('utf-8', errors='ignore')
+            
+            if '#EXTM3U' in text_content:
+                # It's an M3U8 playlist
                 playlist_text = content.decode('utf-8', errors='ignore')
                 rewritten = self.rewrite_playlist(playlist_text, channel_id, token, expires, real_url)
                 
@@ -231,29 +202,27 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_header('Content-Length', str(len(rewritten.encode())))
                 self.end_headers()
                 self.wfile.write(rewritten.encode())
-                
-                print(f"  Playlist rewritten: {len(rewritten)} bytes")
+                print(f"[PROXY] Playlist sent: {len(rewritten)} bytes")
             else:
                 # Binary segment
                 self.send_response(200)
-                self.send_header('Content-Type', content_type or 'video/mp2t')
+                self.send_header('Content-Type', 'video/mp2t')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.send_header('Cache-Control', 'no-store')
                 self.send_header('Content-Length', str(len(content)))
                 self.end_headers()
                 self.wfile.write(content)
-                
-                print(f"  Segment sent: {len(content)} bytes")
+                print(f"[PROXY] Segment sent: {len(content)} bytes")
         
         except urllib.error.HTTPError as e:
-            print(f"  HTTP Error: {e.code}")
+            print(f"[PROXY] HTTP Error: {e.code}")
             self.send_error(e.code)
         except Exception as e:
-            print(f"  Error: {e}")
+            print(f"[PROXY] Error: {e}")
             self.send_error(500)
     
     def rewrite_playlist(self, playlist_content, channel_id, token, expires, base_url):
-        """Rewrite playlist URLs"""
+        """Rewrite playlist URLs to go through proxy"""
         lines = playlist_content.split('\n')
         rewritten = []
         
@@ -347,7 +316,6 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
 if __name__ == '__main__':
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print(f"Chill Box Server on port {PORT}")
-    print(f"Channels: {len(CHANNELS)}")
     
     with http.server.ThreadingHTTPServer(("0.0.0.0", PORT), SecureHandler) as httpd:
         httpd.serve_forever()
