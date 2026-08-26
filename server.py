@@ -6,7 +6,7 @@ import hmac
 import hashlib
 import urllib.request
 import urllib.error
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urljoin
 
 PORT = int(os.getenv('PORT', '8000'))
 API_SECRET = os.getenv('API_SECRET', 'mayatv')
@@ -39,12 +39,10 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(404)
     
     def serve_index(self):
-        """Serve main page - no stream URLs"""
         html = self.render_index()
         self.send_html(html)
     
     def serve_player_page(self, parsed):
-        """Serve player page - NO stream URL in source"""
         params = parse_qs(parsed.query)
         channel_id = params.get('id', [''])[0]
         
@@ -58,12 +56,8 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
             self.send_html("<h1>Channel not found</h1>", 404)
             return
         
-        # Generate token
         expires = int(time.time()) + 300
         token = self.generate_token(channel_id, expires)
-        
-        # The stream URL is NEVER sent to client
-        # Client only gets a proxy URL
         proxy_url = f"/stream?id={channel_id}&token={token}&expires={expires}"
         
         html = f'''<!DOCTYPE html>
@@ -96,7 +90,6 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
     </div>
 
     <script>
-        // Only proxy URL is visible - real stream URL is hidden
         const PROXY_URL = {json.dumps(proxy_url)};
         
         let hls = null;
@@ -108,6 +101,8 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
             if (Hls.isSupported()) {{
                 hls = new Hls({{
                     maxBufferLength: 30,
+                    maxMaxBufferLength: 60,
+                    enableWorker: true,
                     xhrSetup: (xhr) => {{
                         xhr.setRequestHeader('Referer', window.location.origin);
                     }}
@@ -118,20 +113,27 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
                 
                 hls.on(Hls.Events.MANIFEST_PARSED, () => {{
                     loading.style.display = 'none';
-                    video.play();
+                    video.play().catch(() => {{}});
                 }});
                 
                 hls.on(Hls.Events.ERROR, (event, data) => {{
+                    console.log('HLS Error:', data.type);
                     if (data.fatal) {{
-                        loading.innerHTML = '<span>Stream error</span>';
+                        switch(data.type) {{
+                            case Hls.ErrorTypes.NETWORK_ERROR:
+                                hls.startLoad();
+                                break;
+                            case Hls.ErrorTypes.MEDIA_ERROR:
+                                hls.recoverMediaError();
+                                break;
+                            default:
+                                loading.innerHTML = '<span>Stream error - please try again</span>';
+                                break;
+                        }}
                     }}
                 }});
-            }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-                video.src = PROXY_URL;
-                video.addEventListener('loadedmetadata', () => {{
-                    loading.style.display = 'none';
-                    video.play();
-                }});
+            }} else {{
+                loading.innerHTML = '<span>HLS not supported on this browser</span>';
             }}
         }}
         
@@ -143,97 +145,113 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
         self.send_html(html)
     
     def serve_stream_proxy(self, parsed):
-        """Proxy the actual stream - real URL never exposed"""
+        """Proxy the actual stream"""
         params = parse_qs(parsed.query)
         channel_id = params.get('id', [''])[0]
         token = params.get('token', [''])[0]
         expires = params.get('expires', [''])[0]
+        segment_url = params.get('segment', [''])[0]
         
         # Validate token
+        if not token or not expires:
+            self.send_error(403)
+            return
+        
         if not self.validate_token(channel_id, token, expires):
             self.send_error(403)
             return
         
-        # Check expiry
         if int(expires) < int(time.time()):
             self.send_error(403)
             return
         
-        # Get channel
         channel = next((ch for ch in CHANNELS if ch['id'] == channel_id), None)
         
         if not channel:
             self.send_error(404)
             return
         
-        real_url = channel['url']
+        # If segment URL is provided, proxy that segment
+        if segment_url:
+            real_url = segment_url
+        else:
+            real_url = channel['url']
         
-        # Fetch the real stream
         try:
-            req = urllib.request.Request(real_url, headers={
+            # Add headers for the request
+            headers = {
                 'User-Agent': 'Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36',
+                'Accept': '*/*',
                 'Referer': 'https://www.jiotv.com/',
-            })
+            }
             
+            if channel.get('cookie'):
+                headers['Cookie'] = channel['cookie']
+            
+            req = urllib.request.Request(real_url, headers=headers)
             response = urllib.request.urlopen(req, timeout=30)
             
-            # Forward headers
-            self.send_response(200)
-            self.send_header('Content-Type', response.headers.get('Content-Type', 'application/vnd.apple.mpegurl'))
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Cache-Control', 'no-store')
+            content_type = response.headers.get('Content-Type', 'application/vnd.apple.mpegurl')
             
-            # Check if it's a playlist (m3u8) or segment (.ts)
-            if '.m3u8' in real_url:
-                # Read playlist content
-                content = response.read().decode('utf-8', errors='ignore')
+            # Read the content
+            content = response.read()
+            
+            # Check if it's a playlist (text) or segment (binary)
+            if '.m3u8' in real_url or 'playlist' in real_url.lower():
+                # It's a playlist - rewrite URLs
+                playlist_text = content.decode('utf-8', errors='ignore')
+                rewritten = self.rewrite_playlist(playlist_text, channel_id, token, expires, real_url)
                 
-                # Rewrite URLs in the playlist to go through proxy
-                content = self.rewrite_playlist(content, channel_id, token, expires)
-                
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/vnd.apple.mpegurl')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', str(len(rewritten.encode())))
                 self.end_headers()
-                self.wfile.write(content.encode())
+                self.wfile.write(rewritten.encode())
             else:
-                # Stream binary content (segments)
+                # It's a segment - stream binary
+                self.send_response(200)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', str(len(content)))
                 self.end_headers()
-                
-                # Stream in chunks
-                while True:
-                    chunk = response.read(8192)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
+                self.wfile.write(content)
         
         except urllib.error.HTTPError as e:
+            print(f"HTTP Error: {e.code} for {real_url}")
             self.send_error(e.code)
         except Exception as e:
+            print(f"Error: {e}")
             self.send_error(500)
     
-    def rewrite_playlist(self, playlist_content, channel_id, token, expires):
+    def rewrite_playlist(self, playlist_content, channel_id, token, expires, base_url):
         """Rewrite playlist URLs to go through proxy"""
         lines = playlist_content.split('\n')
         rewritten = []
         
         for line in lines:
-            line = line.strip()
+            line = line.rstrip()
             
             if line.startswith('#'):
-                # It's a directive - keep as is
+                # Keep directives as is
                 rewritten.append(line)
             elif line.startswith('http'):
-                # It's a URL - rewrite to proxy
-                proxy_url = f"/stream?id={channel_id}&token={token}&expires={expires}&segment={line}"
+                # Rewrite absolute URL to proxy
+                proxy_url = f"/stream?id={channel_id}&token={token}&expires={expires}&segment={urllib.parse.quote(line)}"
                 rewritten.append(proxy_url)
             elif line:
-                # Relative URL - keep as is
-                rewritten.append(line)
+                # Relative URL - resolve against base
+                absolute_url = urljoin(base_url, line)
+                proxy_url = f"/stream?id={channel_id}&token={token}&expires={expires}&segment={urllib.parse.quote(absolute_url)}"
+                rewritten.append(proxy_url)
             else:
                 rewritten.append('')
         
         return '\n'.join(rewritten)
     
     def generate_token(self, channel_id, expires):
-        """Generate HMAC token"""
         token_data = f"{channel_id}:{expires}"
         token = hmac.new(
             API_SECRET.encode(),
@@ -243,12 +261,10 @@ class SecureHandler(http.server.SimpleHTTPRequestHandler):
         return token
     
     def validate_token(self, channel_id, token, expires):
-        """Validate HMAC token"""
         expected = self.generate_token(channel_id, expires)
         return hmac.compare_digest(token, expected)
     
     def render_index(self):
-        """Render main page"""
         channel_cards = ""
         categories = {}
         
