@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chill Box - Live TV</title>
+    <style>
+        :root {
+            --bg: #0a0a0f;
+            --surface: #141722;
+            --accent: #E50914;
+            --text: #ffffff;
+            --text-muted: #9EA8B6;
+            --border: rgba(255,255,255,0.1);
+        }
+        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            background: var(--bg);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            color: var(--text);
+        }
+        
+        .header {
+            background: var(--surface);
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        
+        .header-inner {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        
+        .logo {
+            font-size: 22px;
+            font-weight: 900;
+        }
+        
+        .logo span { color: var(--accent); }
+        
+        .search-box input {
+            padding: 10px 16px;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            font-size: 14px;
+            width: 300px;
+            outline: none;
+        }
+        
+        .search-box input:focus {
+            border-color: var(--accent);
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .category-section {
+            margin-bottom: 24px;
+        }
+        
+        .category-title {
+            font-size: 16px;
+            font-weight: 700;
+            margin-bottom: 12px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .channel-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 12px;
+        }
+        
+        .channel-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 16px;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-align: center;
+        }
+        
+        .channel-card:hover {
+            border-color: var(--accent);
+            transform: translateY(-3px);
+            box-shadow: 0 8px 20px rgba(0,0,0,0.3);
+        }
+        
+        .channel-logo {
+            width: 50px;
+            height: 50px;
+            margin: 0 auto 10px;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            font-weight: bold;
+            color: var(--accent);
+            overflow: hidden;
+        }
+        
+        .channel-logo img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+        
+        .channel-name {
+            font-size: 13px;
+            font-weight: 600;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-muted);
+        }
+        
+        .spinner {
+            width: 30px;
+            height: 30px;
+            border: 3px solid var(--border);
+            border-top: 3px solid var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .protected-badge {
+            display: inline-block;
+            font-size: 10px;
+            color: #2ED573;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-inner">
+            <div class="logo">Chill<span>Box</span></div>
+            <div class="search-box">
+                <input type="text" id="searchInput" placeholder="Search channels..." oninput="filterChannels()">
+            </div>
+        </div>
+    </div>
+    
+    <div class="container" id="channelContainer">
+        <div class="loading">
+            <div class="spinner"></div>
+            Loading channels...
+        </div>
+    </div>
+
+    <script>
+        // ============ SECURE CHANNEL LOADER ============
+        const API_SECRET = 'mayatv';
+        
+        async function loadChannels() {
+            try {
+                const response = await fetch('/api/get-channels', {
+                    headers: {
+                        'X-API-Key': API_SECRET,
+                        'X-Request-Token': generateToken(),
+                    }
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Failed to load channels');
+                }
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    renderChannels(data.channels);
+                }
+            } catch (error) {
+                console.error('Error loading channels:', error);
+                document.getElementById('channelContainer').innerHTML = `
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        Failed to load channels. Please refresh.
+                    </div>
+                `;
+            }
+        }
+        
+        function generateToken() {
+            // Generate a simple token based on timestamp
+            const timestamp = Date.now();
+            return btoa(timestamp.toString());
+        }
+        
+        function renderChannels(channels) {
+            const container = document.getElementById('channelContainer');
+            
+            // Group by category
+            const categories = {};
+            channels.forEach(ch => {
+                if (!categories[ch.category]) {
+                    categories[ch.category] = [];
+                }
+                categories[ch.category].push(ch);
+            });
+            
+            let html = '';
+            
+            for (const [category, channelList] of Object.entries(categories)) {
+                html += `<div class="category-section" data-category="${category.toLowerCase()}">`;
+                html += `<div class="category-title">${category}</div>`;
+                html += `<div class="channel-grid">`;
+                
+                channelList.forEach(ch => {
+                    const initial = ch.name.charAt(0).toUpperCase();
+                    html += `
+                        <div class="channel-card" 
+                             data-name="${ch.name.toLowerCase()}" 
+                             data-category="${category.toLowerCase()}"
+                             onclick="openPlayer('${ch.id}')">
+                            <div class="channel-logo">${ch.logo ? `<img src="${ch.logo}">` : initial}</div>
+                            <div class="channel-name">${ch.name}</div>
+                            <div class="protected-badge">🔒 Protected</div>
+                        </div>
+                    `;
+                });
+                
+                html += `</div></div>`;
+            }
+            
+            container.innerHTML = html;
+        }
+        
+        function filterChannels() {
+            const query = document.getElementById('searchInput').value.toLowerCase();
+            const cards = document.querySelectorAll('.channel-card');
+            
+            cards.forEach(card => {
+                const name = card.dataset.name;
+                card.style.display = name.includes(query) ? '' : 'none';
+            });
+            
+            // Hide empty categories
+            document.querySelectorAll('.category-section').forEach(section => {
+                const visibleCards = section.querySelectorAll('.channel-card[style*="display: none"], .channel-card:not([style])');
+                const hasVisible = Array.from(section.querySelectorAll('.channel-card')).some(c => c.style.display !== 'none');
+                section.style.display = hasVisible ? '' : 'none';
+            });
+        }
+        
+        function openPlayer(channelId) {
+            // Redirect to secure player page
+            window.location.href = `/player.html?id=${encodeURIComponent(channelId)}`;
+        }
+        
+        // Load channels on page load
+        loadChannels();
+        
+        // Prevent right-click
+        document.addEventListener('contextmenu', (e) => e.preventDefault());
+        
+        // Prevent keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if ((e.ctrlKey && ['s', 'u', 'p'].includes(e.key.toLowerCase())) || e.key === 'F12') {
+                e.preventDefault();
+            }
+        });
+    </script>
+</body>
+</html>
